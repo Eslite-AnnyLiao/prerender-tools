@@ -1,0 +1,26 @@
+{
+  "name": "website-tester",
+  "version": "1.0.0",
+  "description": "用 Headless Chrome 測試網站性能和截圖工具",
+  "main": "website-tester.js",
+  "scripts": {
+    "test": "node website-tester.js",
+    "test:example": "node website-tester.js https://www.google.com https://www.github.com",
+    "install:deps": "npm install"
+  },
+  "keywords": [
+    "puppeteer",
+    "headless-chrome",
+    "website-testing",
+    "performance",
+    "screenshot"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer": "^21.0.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

@@ -1,6 +1,10 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs').promises;
 const path = require('path');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+
+const execAsync = promisify(exec);
 
 class WebsiteTester {
     constructor() {
@@ -50,6 +54,229 @@ class WebsiteTester {
         }
     }
 
+    // 新增：curl 測試方法
+    async testWithCurl(url, options = {}) {
+        const startTime = Date.now();
+        const testResult = {
+            url,
+            method: 'curl',
+            timestamp: new Date().toISOString(),
+            startTime,
+            endTime: null,
+            duration: null,
+            status: 'pending',
+            response: {
+                statusCode: null,
+                headers: {},
+                body: null,
+                bodySize: 0
+            },
+            curlMetrics: {},
+            htmlAnalysis: null,
+            htmlFile: null,
+            errors: []
+        };
+
+        try {
+            console.log(`\n🌐 使用 curl 測試: ${url}`);
+
+            // 建構 curl 命令
+            let curlCommand = `curl -w "%{http_code}|%{time_total}|%{size_download}|%{time_namelookup}|%{time_connect}|%{time_starttransfer}" -s -S --compressed`;
+
+            // 如果使用 Prerender.io
+            if (options.prerenderToken) {
+                const prerenderUrl = `https://service.prerender.io/${url}`;
+                curlCommand += ` -H "X-Prerender-Token: ${options.prerenderToken}"`;
+                curlCommand += ` "${prerenderUrl}"`;
+                testResult.prerenderUrl = prerenderUrl;
+                console.log(`   使用 Prerender.io 服務`);
+                console.log(`   Token: ${options.prerenderToken}`);
+            } else {
+                curlCommand += ` "${url}"`;
+            }
+
+            // 設定 User Agent
+            curlCommand += ` -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"`;
+
+            // 設定其他 headers（移除 Accept-Encoding，讓 --compressed 自動處理）
+            curlCommand += ` -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"`;
+            curlCommand += ` -H "Accept-Language: zh-TW,zh;q=0.9,en;q=0.8"`;
+
+            // 設定超時
+            if (options.timeout) {
+                curlCommand += ` --max-time ${Math.ceil(options.timeout / 1000)}`;
+            }
+
+            // 跟隨重定向
+            curlCommand += ` -L`;
+
+            if (options.debug) {
+                console.log(`   執行命令: ${curlCommand}`);
+            }
+
+            const { stdout, stderr } = await execAsync(curlCommand);
+
+            // 更安全的解析 curl 輸出
+            // curl 的統計數據總是在最後，用特定分隔符分隔
+            const lines = stdout.split('\n');
+            const lastLine = lines[lines.length - 1];
+            const parts = lastLine.split('|');
+
+            if (parts.length >= 6) {
+                // 響應體是除了最後一行的所有內容
+                const responseBody = lines.slice(0, -1).join('\n');
+                const metrics = parts;
+
+                testResult.response.statusCode = parseInt(metrics[0]);
+                testResult.response.body = responseBody;
+                testResult.response.bodySize = parseInt(metrics[2]);
+
+                testResult.curlMetrics = {
+                    totalTime: parseFloat(metrics[1]) * 1000, // 轉換為毫秒
+                    downloadSize: parseInt(metrics[2]),
+                    dnsLookupTime: parseFloat(metrics[3]) * 1000,
+                    connectTime: parseFloat(metrics[4]) * 1000,
+                    timeToFirstByte: parseFloat(metrics[5]) * 1000
+                };
+
+                // 計算各階段時間
+                testResult.curlMetrics.tcpConnectTime = testResult.curlMetrics.connectTime - testResult.curlMetrics.dnsLookupTime;
+                testResult.curlMetrics.serverProcessingTime = testResult.curlMetrics.timeToFirstByte - testResult.curlMetrics.connectTime;
+                testResult.curlMetrics.contentDownloadTime = testResult.curlMetrics.totalTime - testResult.curlMetrics.timeToFirstByte;
+            } else {
+                // 如果解析失敗，至少保存響應內容
+                testResult.response.body = stdout;
+                testResult.response.statusCode = 200; // 假設成功，因為沒有拋出錯誤
+                testResult.curlMetrics = {
+                    totalTime: 0,
+                    downloadSize: stdout.length,
+                    dnsLookupTime: 0,
+                    connectTime: 0,
+                    timeToFirstByte: 0,
+                    tcpConnectTime: 0,
+                    serverProcessingTime: 0,
+                    contentDownloadTime: 0
+                };
+                console.log(`   ⚠️  curl 統計數據解析失敗，使用基本數據`);
+            }
+
+            // 記錄狀態碼，但不立即拋出錯誤（某些服務在 404 時仍返回有用內容）
+            const isHttpError = testResult.response.statusCode < 200 || testResult.response.statusCode >= 400;
+            if (isHttpError) {
+                console.log(`   ⚠️  HTTP 狀態碼: ${testResult.response.statusCode}（但會繼續處理響應內容）`);
+            }
+
+            // 分析 HTML 內容（放寬檢測條件）
+            const responseBody = testResult.response.body;
+            const isHtmlContent = responseBody && (
+                responseBody.includes('<html') ||
+                responseBody.includes('<!DOCTYPE html') ||
+                responseBody.includes('<!doctype html') ||
+                responseBody.includes('<HTML') ||
+                responseBody.includes('<head') ||
+                responseBody.includes('<body') ||
+                responseBody.includes('<div') ||
+                responseBody.includes('<title')
+            );
+
+            if (isHtmlContent) {
+                testResult.htmlAnalysis = this.analyzeHtmlContent(responseBody);
+
+                // 儲存 HTML 檔案
+                if (options.saveHtml !== false) {
+                    const htmlFileName = `${this.sanitizeFilename(url)}_curl_${Date.now()}.html`;
+                    const htmlFilePath = path.join(__dirname, 'html', htmlFileName);
+                    await this.ensureDirectory(path.dirname(htmlFilePath));
+                    await fs.writeFile(htmlFilePath, responseBody, 'utf8');
+                    testResult.htmlFile = htmlFilePath;
+                    console.log(`📄 HTML 內容已存至: ${htmlFilePath}`);
+                }
+            } else {
+                console.log(`   ⚠️  響應內容不是 HTML 格式`);
+                console.log(`   響應長度: ${responseBody.length} 字元`);
+                console.log(`   Content-Type: ${testResult.response.headers['content-type'] || '未知'}`);
+
+                if (options.debug) {
+                    // 檢查是否為二進制內容
+                    const isBinary = responseBody.split('').some(char => {
+                        const code = char.charCodeAt(0);
+                        return code < 32 && code !== 9 && code !== 10 && code !== 13; // 排除 tab, newline, carriage return
+                    });
+
+                    if (isBinary) {
+                        console.log(`   內容類型: 可能是二進制或壓縮內容`);
+                        console.log(`   前 50 字元的字元碼: ${responseBody.substring(0, 50).split('').map(c => c.charCodeAt(0)).join(', ')}`);
+                    } else {
+                        console.log(`   響應內容前 200 字元: ${responseBody.substring(0, 200)}`);
+                    }
+                }
+
+                // 即使不是 HTML，也可以選擇保存原始響應
+                if (options.saveAll) {
+                    const rawFileName = `${this.sanitizeFilename(url)}_curl_raw_${Date.now()}.txt`;
+                    const rawFilePath = path.join(__dirname, 'raw', rawFileName);
+                    await this.ensureDirectory(path.dirname(rawFilePath));
+                    await fs.writeFile(rawFilePath, responseBody, 'utf8');
+                    testResult.rawFile = rawFilePath;
+                    console.log(`📄 原始響應已存至: ${rawFilePath}`);
+                }
+            }
+
+            // 根據狀態碼和內容決定最終狀態
+            if (testResult.response.statusCode >= 200 && testResult.response.statusCode < 300) {
+                testResult.status = 'success';
+            } else if (isHtmlContent && testResult.htmlFile) {
+                // 雖然狀態碼不是 2xx，但獲得了 HTML 內容
+                testResult.status = 'partial_success';
+                testResult.errors.push({
+                    type: 'http_status_warning',
+                    message: `HTTP ${testResult.response.statusCode} 但獲得了 HTML 內容`,
+                    timestamp: Date.now()
+                });
+            } else {
+                // 狀態碼不是 2xx 且沒有有用的內容
+                throw new Error(`HTTP ${testResult.response.statusCode}`);
+            }
+
+            testResult.status = testResult.status || 'success';
+
+            console.log(`✅ curl 測試${testResult.status === 'partial_success' ? '部分成功' : '成功'}: ${url}`);
+            console.log(`   狀態碼: ${testResult.response.statusCode}`);
+
+            if (testResult.curlMetrics && testResult.curlMetrics.totalTime > 0) {
+                console.log(`   總時間: ${testResult.curlMetrics.totalTime.toFixed(1)}ms`);
+                console.log(`   DNS 查詢: ${testResult.curlMetrics.dnsLookupTime.toFixed(1)}ms`);
+                console.log(`   TCP 連線: ${testResult.curlMetrics.tcpConnectTime.toFixed(1)}ms`);
+                console.log(`   伺服器處理: ${testResult.curlMetrics.serverProcessingTime.toFixed(1)}ms`);
+                console.log(`   首位元組時間: ${testResult.curlMetrics.timeToFirstByte.toFixed(1)}ms`);
+                console.log(`   內容下載: ${testResult.curlMetrics.contentDownloadTime.toFixed(1)}ms`);
+            }
+            console.log(`   下載大小: ${testResult.curlMetrics?.downloadSize || testResult.response.bodySize || 0} bytes`);
+
+            if (testResult.htmlAnalysis) {
+                console.log(`   HTML 大小: ${testResult.htmlAnalysis.sizeKB}KB`);
+                console.log(`   外部腳本: ${testResult.htmlAnalysis.externalResources.scripts.length} 個`);
+                console.log(`   外部樣式: ${testResult.htmlAnalysis.externalResources.stylesheets.length} 個`);
+                console.log(`   圖片: ${testResult.htmlAnalysis.externalResources.images.length} 個`);
+            }
+
+        } catch (error) {
+            testResult.status = 'failed';
+            testResult.errors.push({
+                type: 'curl_error',
+                message: error.message,
+                timestamp: Date.now()
+            });
+            console.log(`❌ curl 測試失敗: ${url} - ${error.message}`);
+        }
+
+        testResult.endTime = Date.now();
+        testResult.duration = testResult.endTime - testResult.startTime;
+        this.results.push(testResult);
+
+        return testResult;
+    }
+
     async testWebsite(url, options = {}) {
         const startTime = Date.now();
         const testResult = {
@@ -59,6 +286,8 @@ class WebsiteTester {
             endTime: null,
             duration: null,
             status: 'pending',
+            httpStatusCode: null,    // 新增：HTTP 狀態碼
+            httpStatusText: null,    // 新增：HTTP 狀態文字
             screenshot: null,
             htmlSource: null,
             htmlFile: null,
@@ -104,6 +333,7 @@ class WebsiteTester {
                 'DNT': '1',
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
+                'X-Prerender-Token': options.prerenderToken || '',
             });
 
             // 攔截請求來處理 CORS 問題
@@ -232,10 +462,17 @@ class WebsiteTester {
 
             const navigationEnd = Date.now();
 
-            // 檢查頁面響應狀態
-            if (!response.ok()) {
-                throw new Error(`HTTP ${response.status()}: ${response.statusText()}`);
+            // 記錄響應狀態，但不立即拋出錯誤（某些服務在 404 時仍返回有用內容）
+            const httpStatusCode = response.status();
+            const httpStatusText = response.statusText();
+            const isHttpError = !response.ok();
+            if (isHttpError) {
+                console.log(`   ⚠️  HTTP 狀態碼: ${httpStatusCode}（但會繼續處理頁面內容）`);
             }
+
+            // 保存狀態碼到測試結果中
+            testResult.httpStatusCode = httpStatusCode;
+            testResult.httpStatusText = httpStatusText;
 
             // 等待頁面完全加載
             await page.waitForTimeout(options.waitTime || 2000);
@@ -499,6 +736,10 @@ class WebsiteTester {
                 console.log(`   HTML 大小: ${Math.round(testResult.htmlSource.length / 1024)}KB`);
             }
 
+            if (testResult.status === 'partial_success') {
+                console.log(`   ℹ️  注意：雖然 HTTP 狀態碼為 ${testResult.httpStatusCode}，但成功獲取了頁面內容`);
+            }
+
         } catch (error) {
             testResult.status = 'failed';
             testResult.errors.push({
@@ -507,6 +748,11 @@ class WebsiteTester {
                 timestamp: Date.now()
             });
             console.log(`❌ 測試失敗: ${url} - ${error.message}`);
+
+            // 如果有 HTTP 狀態碼信息，也要顯示
+            if (testResult.httpStatusCode) {
+                console.log(`   HTTP 狀態碼: ${testResult.httpStatusCode}`);
+            }
         } finally {
             testResult.endTime = Date.now();
             testResult.duration = testResult.endTime - testResult.startTime;
@@ -519,6 +765,38 @@ class WebsiteTester {
         }
 
         return testResult;
+    }
+
+    // 新增：測試多個網站（支援 curl 或 puppeteer）
+    async testMultipleWebsites(urls, options = {}) {
+        console.log(`\n📋 開始測試 ${urls.length} 個網站...`);
+
+        if (options.method === 'curl') {
+            console.log(`   使用方法: curl`);
+        } else {
+            console.log(`   使用方法: Puppeteer`);
+        }
+
+        const results = [];
+        for (let i = 0; i < urls.length; i++) {
+            const url = urls[i];
+            console.log(`\n[${i + 1}/${urls.length}] 測試進度`);
+
+            let result;
+            if (options.method === 'curl') {
+                result = await this.testWithCurl(url, options);
+            } else {
+                result = await this.testWebsite(url, options);
+            }
+            results.push(result);
+
+            // 可選的延遲時間
+            if (options.delay && i < urls.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, options.delay));
+            }
+        }
+
+        return results;
     }
 
     // 新增：計算資源載入時間統計
@@ -566,42 +844,28 @@ class WebsiteTester {
         };
     }
 
-    async testMultipleWebsites(urls, options = {}) {
-        console.log(`\n📋 開始測試 ${urls.length} 個網站...`);
-
-        const results = [];
-        for (let i = 0; i < urls.length; i++) {
-            const url = urls[i];
-            console.log(`\n[${i + 1}/${urls.length}] 測試進度`);
-            const result = await this.testWebsite(url, options);
-            results.push(result);
-
-            // 可選的延遲時間
-            if (options.delay && i < urls.length - 1) {
-                await new Promise(resolve => setTimeout(resolve, options.delay));
-            }
-        }
-
-        return results;
-    }
-
     async generateReport(outputPath = null) {
         const reportPath = outputPath || path.join(__dirname, 'reports', `test_report_${Date.now()}.json`);
         await this.ensureDirectory(path.dirname(reportPath));
 
         const htmlResults = this.results.filter(r => r.htmlAnalysis);
-        const successfulResults = this.results.filter(r => r.status === 'success');
+        const successfulResults = this.results.filter(r => r.status === 'success' || r.status === 'partial_success');
+        const curlResults = this.results.filter(r => r.method === 'curl');
 
         // 計算資源載入統計
-        const allResourceTiming = successfulResults.flatMap(r => r.resourceTiming || []);
+        const puppeteerResults = this.results.filter(r => r.method !== 'curl' && r.resourceTiming);
+        const allResourceTiming = puppeteerResults.flatMap(r => r.resourceTiming || []);
         const resourceStats = this.calculateGlobalResourceStats(allResourceTiming);
 
         const summary = {
             totalTests: this.results.length,
             successfulTests: successfulResults.length,
+            partialSuccessTests: this.results.filter(r => r.status === 'partial_success').length,
             failedTests: this.results.filter(r => r.status === 'failed').length,
+            curlTests: curlResults.length,
+            puppeteerTests: this.results.length - curlResults.length,
             averageLoadTime: this.calculateAverageLoadTime(),
-            resourceStatistics: resourceStats, // 新增：全域資源統計
+            resourceStatistics: resourceStats,
             htmlStatistics: htmlResults.length > 0 ? {
                 totalHtmlFiles: htmlResults.length,
                 averageHtmlSize: Math.round(htmlResults.reduce((sum, r) => sum + r.htmlAnalysis.sizeKB, 0) / htmlResults.length),
@@ -617,7 +881,7 @@ class WebsiteTester {
             const { htmlSource, ...resultWithoutHtml } = result;
             return {
                 ...resultWithoutHtml,
-                htmlSourceLength: htmlSource ? htmlSource.length : 0
+                htmlSourceLength: htmlSource ? htmlSource.length : (result.response?.body?.length || 0)
             };
         });
 
@@ -631,11 +895,14 @@ class WebsiteTester {
         console.log(`\n📊 測試報告已產生:`);
         console.log(`   檔案位置: ${reportPath}`);
         console.log(`   總測試數: ${summary.totalTests}`);
-        console.log(`   成功: ${summary.successfulTests}`);
+        console.log(`   完全成功: ${summary.successfulTests - summary.partialSuccessTests}`);
+        console.log(`   部分成功: ${summary.partialSuccessTests}`);
         console.log(`   失敗: ${summary.failedTests}`);
+        console.log(`   curl 測試: ${summary.curlTests}`);
+        console.log(`   Puppeteer 測試: ${summary.puppeteerTests}`);
         console.log(`   平均載入時間: ${summary.averageLoadTime}ms`);
 
-        if (summary.resourceStatistics) {
+        if (summary.resourceStatistics && summary.resourceStatistics.totalRequests > 0) {
             console.log(`   總資源請求數: ${summary.resourceStatistics.totalRequests}`);
             console.log(`   平均資源載入時間: ${summary.resourceStatistics.averageLoadTime}ms`);
             console.log(`   最慢資源類型: ${summary.resourceStatistics.slowestResourceType}`);
@@ -745,11 +1012,23 @@ class WebsiteTester {
     }
 
     calculateAverageLoadTime() {
-        const successfulResults = this.results.filter(r => r.status === 'success' && r.metrics.navigationTime);
+        const successfulResults = this.results.filter(r => r.status === 'success' || r.status === 'partial_success');
         if (successfulResults.length === 0) return 0;
 
-        const totalTime = successfulResults.reduce((sum, result) => sum + result.metrics.navigationTime, 0);
-        return Math.round(totalTime / successfulResults.length);
+        let totalTime = 0;
+        let count = 0;
+
+        successfulResults.forEach(result => {
+            if (result.method === 'curl' && result.curlMetrics?.totalTime) {
+                totalTime += result.curlMetrics.totalTime;
+                count++;
+            } else if (result.metrics?.navigationTime) {
+                totalTime += result.metrics.navigationTime;
+                count++;
+            }
+        });
+
+        return count > 0 ? Math.round(totalTime / count) : 0;
     }
 
     analyzeHtmlContent(htmlContent) {
@@ -829,29 +1108,49 @@ async function main() {
         console.log(`
 用法: node website-tester.js <網址1> [網址2] [網址3] ...
 
-範例:
-  node website-tester.js https://www.google.com
-  node website-tester.js 'http://prerender.dev.eslite.com/render?url=https://www.dev.eslite.com/product/123'
-  
-選項:
+測試方法:
+  (預設)                使用 Puppeteer 進行詳細測試（包含截圖）
+  --curl-only          只使用 curl 進行快速測試（包含 HTML 保存）
+
+curl 相關選項:
+  --prerender-token=xxx  使用 Prerender.io 服務的 Token
+
+一般選項:
   --width=1920      設定視窗寬度 (預設: 1920)
   --height=1080     設定視窗高度 (預設: 1080)  
   --timeout=30000   設定超時時間 (預設: 30000ms)
   --delay=1000      設定測試間隔 (預設: 0ms)
-  --wait=5000       頁面載入後額外等待時間 (預設: 2000ms)
-  --fullpage        截取完整頁面 (預設: false)
-  --no-headless     顯示瀏覽器視窗 (預設: headless)
-  --devtools        開啟開發者工具 (預設: false)
+  --wait=5000       頁面載入後額外等待時間 (僅 Puppeteer，預設: 2000ms)
+  --fullpage        截取完整頁面 (僅 Puppeteer，預設: false)
+  --no-headless     顯示瀏覽器視窗 (僅 Puppeteer，預設: headless)
+  --devtools        開啟開發者工具 (僅 Puppeteer，預設: false)
   --no-html         不保存 HTML 原始碼 (預設: 保存)
-  --html-only       只保存 HTML，不截圖 (預設: false)
+  --save-all        保存所有響應內容，即使不是 HTML (預設: 僅保存 HTML)
+  --debug           顯示詳細除錯資訊
 
-特殊用途:
-  --debug           顯示詳細除錯資訊和原始 Performance API 數據
-  --compare         比較多個 URL 的差異 (會生成對比報告)
+範例:
+  # 預設 Puppeteer 測試（詳細但較慢）
+  node website-tester.js https://www.google.com
+  
+  # 快速 curl 測試（包含 HTML 保存）
+  node website-tester.js --curl-only https://www.google.com
+  
+  # 使用 Prerender.io 測試
+  node website-tester.js --curl-only --prerender-token=Ma5RAsX7v3mwQXfKqYni https://www.stg.eslite.com/product/1001173072855709
+  
+  # 批量測試
+  node website-tester.js --curl-only --prerender-token=Ma5RAsX7v3mwQXfKqYni \\
+    https://www.stg.eslite.com/product/1001173072855709 \\
+    https://www.stg.eslite.com/product/1001279052682495
+
+測試方法比較:
+  --curl-only   ⚡ 快速，有 HTML，無截圖，適合批量檢查和 SEO 測試
+  (預設)        🔍 詳細，有 HTML，有截圖，適合完整分析
 
 注意事項:
-  - 某些 SPA 或特殊渲染的網站可能無法提供完整的性能時間
-  - 使用 --debug 可以查看原始 Performance API 數據來診斷問題
+  - curl 測試速度快，適合批量檢查或 CI/CD
+  - curl 測試會保存 HTML 原始碼但無法截圖
+  - 使用 --prerender-token 可以測試預渲染效果
 `);
         process.exit(1);
     }
@@ -859,6 +1158,7 @@ async function main() {
     // 解析參數
     const urls = [];
     const options = {
+        method: 'puppeteer', // 預設使用 puppeteer
         width: 1920,
         height: 1080,
         timeout: 30000,
@@ -870,11 +1170,16 @@ async function main() {
         waitTime: 2000,
         saveHtml: true,
         saveScreenshot: true,
-        compare: false
+        saveAll: false,  // 新增：是否保存所有響應內容
+        prerenderToken: null
     };
 
     args.forEach(arg => {
-        if (arg.startsWith('--width=')) {
+        if (arg === '--curl-only') {
+            options.method = 'curl';
+        } else if (arg.startsWith('--prerender-token=')) {
+            options.prerenderToken = arg.split('=')[1];
+        } else if (arg.startsWith('--width=')) {
             options.width = parseInt(arg.split('=')[1]);
         } else if (arg.startsWith('--height=')) {
             options.height = parseInt(arg.split('=')[1]);
@@ -894,11 +1199,8 @@ async function main() {
             options.debug = true;
         } else if (arg === '--no-html') {
             options.saveHtml = false;
-        } else if (arg === '--html-only') {
-            options.saveHtml = true;
-            options.saveScreenshot = false;
-        } else if (arg === '--compare') {
-            options.compare = true;
+        } else if (arg === '--save-all') {
+            options.saveAll = true;
         } else if (arg.startsWith('http')) {
             urls.push(arg);
         }
@@ -912,10 +1214,14 @@ async function main() {
     const tester = new WebsiteTester();
 
     try {
-        await tester.init({
-            headless: options.headless,
-            devtools: options.devtools
-        });
+        // 只有在使用 Puppeteer 時才初始化瀏覽器
+        if (options.method !== 'curl') {
+            await tester.init({
+                headless: options.headless,
+                devtools: options.devtools
+            });
+        }
+
         await tester.testMultipleWebsites(urls, options);
         await tester.generateReport();
     } catch (error) {
